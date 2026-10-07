@@ -76,11 +76,15 @@ $script:Rights = @{
     # Depot : traverser + creer fichiers/dossiers, sans lister le contenu
     DepotFolder    = $FSR::Traverse -bor $FSR::CreateFiles -bor $FSR::CreateDirectories -bor `
                      $FSR::ReadAttributes -bor $FSR::ReadExtendedAttributes -bor $FSR::Synchronize
-    # Depot : ecrire dans les fichiers deposes, sans pouvoir les lire
+    # Depot : ecrire dans un fichier sans pouvoir le lire. N'est plus attribue aux membres
+    # (ils pourraient ecraser les fichiers des autres) ; conserve pour reconnaitre et
+    # supprimer cette ACE sur les partages crees par une version precedente du script.
     DepotFiles     = $FSR::WriteData -bor $FSR::AppendData -bor $FSR::WriteAttributes -bor `
                      $FSR::WriteExtendedAttributes -bor $FSR::Synchronize
 }
-$script:Rights.OwnerRights = $script:Rights.DepotFolder -bor $script:Rights.DepotFiles
+# OWNER RIGHTS : seul l'auteur d'un depot peut ecrire/remplacer/supprimer SON fichier,
+# toujours sans pouvoir le relire.
+$script:Rights.OwnerRights = $script:Rights.DepotFolder -bor $script:Rights.DepotFiles -bor $FSR::Delete
 
 $script:Inherit = @{
     None = $IFL::None
@@ -444,12 +448,16 @@ function Get-ModifyRules($Sid) {
     )
 }
 
-# Depot : creation possible, aucun droit de lecture/liste
+# Depot : creation possible, aucun droit de lecture/liste. Les droits sur le fichier
+# depose viennent de l'ACE OWNER RIGHTS (auteur du fichier uniquement).
 function Get-DepotRules($Sid) {
     return @(
-        (New-FsRule $Sid $script:Rights.DepotFolder $script:Inherit.CI $script:Propagate.None),
-        (New-FsRule $Sid $script:Rights.DepotFiles $script:Inherit.OI $script:Propagate.InheritOnly)
+        (New-FsRule $Sid $script:Rights.DepotFolder $script:Inherit.CI $script:Propagate.None)
     )
+}
+
+function Get-OwnerRightsRule {
+    return New-FsRule $script:SidOwnerRights $script:Rights.OwnerRights $script:Inherit.Both $script:Propagate.InheritOnly
 }
 
 function Get-RootReadRule($Sid) {
@@ -911,7 +919,7 @@ function New-StructuredShare {
         }
 
         # Depot : le proprietaire d'un fichier depose ne recupere pas de droit de lecture implicite
-        Add-FolderRules $depot @(New-FsRule $script:SidOwnerRights $script:Rights.OwnerRights $script:Inherit.Both $script:Propagate.InheritOnly)
+        Add-FolderRules $depot @(Get-OwnerRightsRule)
         Write-Ok 'Droits NTFS de base appliques.'
 
         # Partage SMB
@@ -920,14 +928,16 @@ function New-StructuredShare {
             Name                  = $name
             Path                  = $root
             FullAccess            = Get-AdminsName
-            FolderEnumerationMode = 'AccessBased'
+            # Pas d'enumeration basee sur l'acces : elle masquerait le dossier Depot,
+            # sur lequel les membres n'ont volontairement pas le droit de lister.
+            FolderEnumerationMode = 'Unrestricted'
             ErrorAction           = 'Stop'
         }
         if ($description) { $params.Description = $description }
         New-SmbShare @params | Out-Null
         $share = @(Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -ieq $name }) | Select-Object -First 1
         if (-not $share) { throw "le partage '$name' est introuvable apres sa creation." }
-        Write-Ok "Partage \\$($script:Ctx.Fqdn)\$name cree (enumeration basee sur l'acces activee)."
+        Write-Ok "Partage \\$($script:Ctx.Fqdn)\$name cree."
     } catch {
         Write-Err "Echec lors de l'etape '$step' : $($_.Exception.Message)"
         Write-Err "Le partage '$name' n'a pas ete cree completement. Corrigez le probleme puis relancez la creation."
@@ -951,6 +961,45 @@ function New-StructuredShare {
     if ($script:Ctx.GpOk -and (Read-YesNo 'Creer maintenant une GPO de mappage pour ce partage ?')) {
         New-DriveMapGpo -Share $share
     }
+}
+
+# =====================================================================
+#  7. Mise a jour des droits du dossier Depot (partages existants)
+# =====================================================================
+
+function Repair-DepotRights {
+    Write-Title "Mettre a jour les droits du dossier $DepotFolderName"
+    Write-Info "Corrige les partages crees avec une version precedente du script :"
+    Write-Info "  - desactive l'enumeration basee sur l'acces (qui masquait le dossier $DepotFolderName)"
+    Write-Info "  - retire aux membres le droit d'ecrire dans les fichiers deposes par les autres"
+    Write-Info "  - seul l'auteur d'un depot garde l'ecriture/suppression de son propre fichier"
+
+    $share = Select-Share
+    if (-not $share) { return }
+    $layout = Get-ShareLayout $share
+    if (-not $layout.Structured) {
+        Write-Err "Le partage '$($share.Name)' ne contient pas les dossiers $CommonFolderName/$DepotFolderName."
+        return
+    }
+    if (-not (Read-YesNo "Mettre a jour le partage $($share.Name) ?" $true)) { return }
+
+    Set-SmbShare -Name $share.Name -FolderEnumerationMode Unrestricted -Force -ErrorAction Stop
+    Write-Ok "Enumeration basee sur l'acces desactivee : le dossier $DepotFolderName est visible."
+
+    $sync = [int]$FSR::Synchronize
+    $oldFiles = [int]$script:Rights.DepotFiles -band (-bnot $sync)
+    $acl = Get-FolderAcl $layout.Depot
+    $removed = 0
+    foreach ($r in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
+        $v = [int]$r.FileSystemRights -band (-bnot $sync)
+        if ($r.IdentityReference.Value -eq $script:SidOwnerRights.Value -or $v -eq $oldFiles) {
+            [void]$acl.RemoveAccessRuleSpecific($r)
+            if ($r.IdentityReference.Value -ne $script:SidOwnerRights.Value) { $removed++ }
+        }
+    }
+    $acl.AddAccessRule((Get-OwnerRightsRule))
+    Set-FolderAcl $layout.Depot $acl
+    Write-Ok "$removed droit(s) d'ecriture sur les fichiers des autres retire(s), droits de l'auteur mis a jour."
 }
 
 # =====================================================================
@@ -1333,6 +1382,7 @@ function Show-Menu {
     Write-Host "  [4] Retirer l'acces a un partage"
     Write-Host '  [5] Creer un nouveau partage'
     Write-Host '  [6] Creer une GPO de mappage pour un partage non mappe'
+    Write-Host "  [7] Mettre a jour les droits du dossier $DepotFolderName d'un partage existant"
     Write-Host '  [Q] Quitter'
     Write-Host ''
 }
@@ -1359,6 +1409,7 @@ while ($true) {
             '4' { Remove-ShareAccess }
             '5' { New-StructuredShare }
             '6' { New-DriveMapGpo }
+            '7' { Repair-DepotRights }
             default { Write-Warn 'Choix invalide.' }
         }
     } catch {

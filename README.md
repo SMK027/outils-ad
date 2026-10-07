@@ -15,6 +15,7 @@ Le fichier est en ASCII pur (aucun accent) pour éviter les problèmes d'encodag
 | 4 | Retirer l'accès (SMB + NTFS) à un ou plusieurs utilisateurs/groupes |
 | 5 | Créer un nouveau partage avec la structure standard |
 | 6 | Créer une GPO de mappage de lecteur pour un partage qui n'est pas encore mappé |
+| 7 | Mettre à jour les droits du dossier `Depot` d'un partage créé avec une version précédente du script |
 
 ### Structure d'un partage créé
 
@@ -24,10 +25,13 @@ Le fichier est en ASCII pur (aucun accent) pour éviter les problèmes d'encodag
  |-- Commun     Membres + gestionnaires : lecture/modification
  |              (le dossier Commun lui-même ne peut être ni supprimé ni renommé)
  |-- Depot      Membres : dépôt uniquement (création de fichiers/dossiers, aucune lecture ni liste)
+                Auteur d'un dépôt : peut remplacer/supprimer son propre fichier, sans le relire
                 Gestionnaires : lecture/modification
 ```
 
-- L'énumération basée sur l'accès (ABE) est activée sur le partage.
+- L'énumération basée sur l'accès (ABE) est **désactivée** : elle masquerait le dossier `Depot`, puisque les membres n'ont pas le droit d'en lister le contenu.
+- **Déposer un fichier** : glisser-déposer le fichier **sur l'icône** du dossier `Depot` (ou copier puis clic droit > Coller sur l'icône). Ouvrir le dossier par double-clic affiche « accès refusé », c'est voulu.
+- Un membre ne peut ni voir, ni lire, ni écraser les fichiers déposés par les autres.
 - Droit de partage SMB : `Modifier` pour chaque compte ajouté, `Contrôle total` pour les Administrateurs.
 - Dans `Depot`, une ACE `OWNER RIGHTS` empêche l'auteur d'un dépôt de relire son fichier grâce aux droits implicites du propriétaire.
 - Si un partage existant n'a pas les sous-dossiers `Commun`/`Depot`, l'ajout d'un compte donne la lecture/modification sur tout le partage (après confirmation).
