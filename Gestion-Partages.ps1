@@ -803,12 +803,19 @@ function Remove-ShareAccess {
 #  5. Creer un nouveau partage
 # =====================================================================
 
+# Get-SmbShare -Name leve une erreur quand le partage n'existe pas, meme avec
+# -ErrorAction SilentlyContinue lorsque $ErrorActionPreference vaut Stop
+# (cmdlet CIM) : on liste donc tous les partages et on filtre sur le nom.
+function Test-ShareExists([string]$Name) {
+    return [bool](@(Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -ieq $Name }).Count)
+}
+
 function Test-ShareName([string]$Name) {
     if ($Name.Length -gt 80) { return 'Nom trop long (80 caracteres maximum).' }
     if ($Name -match '[\\/\[\]:|<>+=;,?*"]') { return 'Le nom contient un caractere interdit : \ / [ ] : | < > + = ; , ? * "' }
     if ($Name -match '[\. ]$') { return 'Le nom ne doit pas se terminer par un point ou un espace.' }
     if ($Name -match '[^\x20-\x7E]') { return 'Utilisez uniquement des caracteres sans accent.' }
-    if (Get-SmbShare -Name $Name -ErrorAction SilentlyContinue) { return "Le partage '$Name' existe deja." }
+    if (Test-ShareExists $Name) { return "Le partage '$Name' existe deja." }
     return $null
 }
 
@@ -876,46 +883,57 @@ function New-StructuredShare {
     $commun = Join-Path $root $CommonFolderName
     $depot  = Join-Path $root $DepotFolderName
 
-    # Dossiers
-    foreach ($d in @($root, $commun, $depot)) {
-        if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
-    }
-    Write-Ok 'Dossiers crees.'
-
-    # Racine : heritage coupe, Administrateurs + Systeme en controle total
-    $acl = New-Object System.Security.AccessControl.DirectorySecurity
-    $acl.SetAccessRuleProtection($true, $false)
-    $acl.AddAccessRule((New-FsRule $script:SidAdmins $script:Rights.FullControl $script:Inherit.Both $script:Propagate.None))
-    $acl.AddAccessRule((New-FsRule $script:SidSystem $script:Rights.FullControl $script:Inherit.Both $script:Propagate.None))
-    Set-FolderAcl $root $acl
-
-    # Sous-dossiers : heritage actif, aucun droit explicite
-    foreach ($d in @($commun, $depot)) {
-        $acl = Get-FolderAcl $d
-        $acl.SetAccessRuleProtection($false, $false)
-        foreach ($r in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
-            [void]$acl.RemoveAccessRuleSpecific($r)
+    $step = 'creation des dossiers'
+    try {
+        # Dossiers
+        foreach ($d in @($root, $commun, $depot)) {
+            if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
         }
-        Set-FolderAcl $d $acl
+        Write-Ok 'Dossiers crees.'
+
+        $step = 'application des droits NTFS'
+
+        # Racine : heritage coupe, Administrateurs + Systeme en controle total
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.AddAccessRule((New-FsRule $script:SidAdmins $script:Rights.FullControl $script:Inherit.Both $script:Propagate.None))
+        $acl.AddAccessRule((New-FsRule $script:SidSystem $script:Rights.FullControl $script:Inherit.Both $script:Propagate.None))
+        Set-FolderAcl $root $acl
+
+        # Sous-dossiers : heritage actif, aucun droit explicite
+        foreach ($d in @($commun, $depot)) {
+            $acl = Get-FolderAcl $d
+            $acl.SetAccessRuleProtection($false, $false)
+            foreach ($r in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
+                [void]$acl.RemoveAccessRuleSpecific($r)
+            }
+            Set-FolderAcl $d $acl
+        }
+
+        # Depot : le proprietaire d'un fichier depose ne recupere pas de droit de lecture implicite
+        Add-FolderRules $depot @(New-FsRule $script:SidOwnerRights $script:Rights.OwnerRights $script:Inherit.Both $script:Propagate.InheritOnly)
+        Write-Ok 'Droits NTFS de base appliques.'
+
+        # Partage SMB
+        $step = 'creation du partage SMB'
+        $params = @{
+            Name                  = $name
+            Path                  = $root
+            FullAccess            = Get-AdminsName
+            FolderEnumerationMode = 'AccessBased'
+            ErrorAction           = 'Stop'
+        }
+        if ($description) { $params.Description = $description }
+        New-SmbShare @params | Out-Null
+        $share = @(Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -ieq $name }) | Select-Object -First 1
+        if (-not $share) { throw "le partage '$name' est introuvable apres sa creation." }
+        Write-Ok "Partage \\$($script:Ctx.Fqdn)\$name cree (enumeration basee sur l'acces activee)."
+    } catch {
+        Write-Err "Echec lors de l'etape '$step' : $($_.Exception.Message)"
+        Write-Err "Le partage '$name' n'a pas ete cree completement. Corrigez le probleme puis relancez la creation."
+        return
     }
 
-    # Depot : le proprietaire d'un fichier depose ne recupere pas de droit de lecture implicite
-    Add-FolderRules $depot @(New-FsRule $script:SidOwnerRights $script:Rights.OwnerRights $script:Inherit.Both $script:Propagate.InheritOnly)
-    Write-Ok 'Droits NTFS de base appliques.'
-
-    # Partage SMB
-    $params = @{
-        Name                  = $name
-        Path                  = $root
-        FullAccess            = Get-AdminsName
-        FolderEnumerationMode = 'AccessBased'
-        ErrorAction           = 'Stop'
-    }
-    if ($description) { $params.Description = $description }
-    New-SmbShare @params | Out-Null
-    Write-Ok "Partage \\$($script:Ctx.Fqdn)\$name cree (enumeration basee sur l'acces activee)."
-
-    $share = Get-SmbShare -Name $name -ErrorAction Stop
     $layout = Get-ShareLayout $share
     foreach ($p in $members) {
         try {
