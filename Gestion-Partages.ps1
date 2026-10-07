@@ -73,7 +73,8 @@ $script:Rights = @{
     Modify         = $FSR::Modify
     # Modification sur le dossier lui-meme mais sans pouvoir le supprimer/renommer
     ModifyNoDelete = [System.Security.AccessControl.FileSystemRights]([int]$FSR::Modify -band (-bnot [int]$FSR::Delete))
-    # Depot : traverser + creer fichiers/dossiers, sans lister le contenu
+    # Depot (ancienne version, conserve pour la mise a jour des partages existants) :
+    # traverser + creer, sans lister. L'explorateur Windows refuse alors toute copie.
     DepotFolder    = $FSR::Traverse -bor $FSR::CreateFiles -bor $FSR::CreateDirectories -bor `
                      $FSR::ReadAttributes -bor $FSR::ReadExtendedAttributes -bor $FSR::Synchronize
     # Depot : ecrire dans un fichier sans pouvoir le lire. N'est plus attribue aux membres
@@ -82,9 +83,17 @@ $script:Rights = @{
     DepotFiles     = $FSR::WriteData -bor $FSR::AppendData -bor $FSR::WriteAttributes -bor `
                      $FSR::WriteExtendedAttributes -bor $FSR::Synchronize
 }
-# OWNER RIGHTS : seul l'auteur d'un depot peut ecrire/remplacer/supprimer SON fichier,
-# toujours sans pouvoir le relire.
-$script:Rights.OwnerRights = $script:Rights.DepotFolder -bor $script:Rights.DepotFiles -bor $FSR::Delete
+# Depot - membres (dossier Depot seulement) : creer + lister. L'explorateur a besoin de
+# lister la destination pour copier. Grace a l'enumeration basee sur l'acces (ABE), la
+# liste n'affiche que les elements lisibles : aucun fichier depose n'est lisible par
+# les membres, le dossier leur apparait donc vide.
+$script:Rights.DepotMember = $script:Rights.DepotFolder -bor $FSR::ListDirectory
+# OWNER RIGHTS : seul l'auteur d'un depot peut remplacer/supprimer SON fichier, sans le relire
+$script:Rights.OwnerFiles = $script:Rights.DepotFiles -bor $FSR::ReadAttributes -bor `
+                            $FSR::ReadExtendedAttributes -bor $FSR::Delete
+# ... et deposer dans les sous-dossiers qu'il a lui-meme crees
+$script:Rights.OwnerFolders = $script:Rights.DepotMember -bor $FSR::WriteAttributes -bor `
+                              $FSR::WriteExtendedAttributes -bor $FSR::Delete
 
 $script:Inherit = @{
     None = $IFL::None
@@ -448,16 +457,19 @@ function Get-ModifyRules($Sid) {
     )
 }
 
-# Depot : creation possible, aucun droit de lecture/liste. Les droits sur le fichier
-# depose viennent de l'ACE OWNER RIGHTS (auteur du fichier uniquement).
+# Depot : creation + liste sur le dossier Depot seulement, aucune lecture des fichiers.
+# Les droits sur le fichier depose viennent de OWNER RIGHTS (auteur uniquement).
 function Get-DepotRules($Sid) {
     return @(
-        (New-FsRule $Sid $script:Rights.DepotFolder $script:Inherit.CI $script:Propagate.None)
+        (New-FsRule $Sid $script:Rights.DepotMember $script:Inherit.None $script:Propagate.None)
     )
 }
 
-function Get-OwnerRightsRule {
-    return New-FsRule $script:SidOwnerRights $script:Rights.OwnerRights $script:Inherit.Both $script:Propagate.InheritOnly
+function Get-OwnerRightsRules {
+    return @(
+        (New-FsRule $script:SidOwnerRights $script:Rights.OwnerFiles $script:Inherit.OI $script:Propagate.InheritOnly),
+        (New-FsRule $script:SidOwnerRights $script:Rights.OwnerFolders $script:Inherit.CI $script:Propagate.InheritOnly)
+    )
 }
 
 function Get-RootReadRule($Sid) {
@@ -472,9 +484,11 @@ function Format-Rights($Rights) {
         'Modification'                             = $script:Rights.Modify
         'Modification (dossier non supprimable)'   = $script:Rights.ModifyNoDelete
         'Lecture'                                  = $script:Rights.Read
-        'Depot (creation sans lecture)'            = $script:Rights.DepotFolder
-        'Depot (ecriture fichiers sans lecture)'   = $script:Rights.DepotFiles
-        'Depot (restriction proprietaire)'         = $script:Rights.OwnerRights
+        'Depot (creation + liste, sans lecture)'   = $script:Rights.DepotMember
+        'Depot (auteur : son fichier, sans lecture)' = $script:Rights.OwnerFiles
+        'Depot (auteur : ses sous-dossiers)'       = $script:Rights.OwnerFolders
+        'Depot ancienne version (option 7)'        = $script:Rights.DepotFolder
+        'Depot ancienne version (ecriture)'        = $script:Rights.DepotFiles
     }
     foreach ($k in $known.Keys) {
         if ($v -eq ([int]$known[$k] -band (-bnot $sync))) { return $k }
@@ -919,7 +933,7 @@ function New-StructuredShare {
         }
 
         # Depot : le proprietaire d'un fichier depose ne recupere pas de droit de lecture implicite
-        Add-FolderRules $depot @(Get-OwnerRightsRule)
+        Add-FolderRules $depot (Get-OwnerRightsRules)
         Write-Ok 'Droits NTFS de base appliques.'
 
         # Partage SMB
@@ -928,9 +942,8 @@ function New-StructuredShare {
             Name                  = $name
             Path                  = $root
             FullAccess            = Get-AdminsName
-            # Pas d'enumeration basee sur l'acces : elle masquerait le dossier Depot,
-            # sur lequel les membres n'ont volontairement pas le droit de lister.
-            FolderEnumerationMode = 'Unrestricted'
+            # Indispensable : masque aux membres les fichiers deposes dans Depot
+            FolderEnumerationMode = 'AccessBased'
             ErrorAction           = 'Stop'
         }
         if ($description) { $params.Description = $description }
@@ -969,10 +982,11 @@ function New-StructuredShare {
 
 function Repair-DepotRights {
     Write-Title "Mettre a jour les droits du dossier $DepotFolderName"
-    Write-Info "Corrige les partages crees avec une version precedente du script :"
-    Write-Info "  - desactive l'enumeration basee sur l'acces (qui masquait le dossier $DepotFolderName)"
-    Write-Info "  - retire aux membres le droit d'ecrire dans les fichiers deposes par les autres"
-    Write-Info "  - seul l'auteur d'un depot garde l'ecriture/suppression de son propre fichier"
+    Write-Info "Applique les droits actuels du dossier $DepotFolderName a un partage existant :"
+    Write-Info "  - active l'enumeration basee sur l'acces (les fichiers deposes restent invisibles)"
+    Write-Info "  - membres : creation + liste du dossier $DepotFolderName, aucune lecture des fichiers"
+    Write-Info "  - auteur d'un depot : remplacement/suppression de son propre fichier, sans lecture"
+    Write-Info "  - les gestionnaires du depot ne sont pas modifies"
 
     $share = Select-Share
     if (-not $share) { return }
@@ -983,23 +997,34 @@ function Repair-DepotRights {
     }
     if (-not (Read-YesNo "Mettre a jour le partage $($share.Name) ?" $true)) { return }
 
-    Set-SmbShare -Name $share.Name -FolderEnumerationMode Unrestricted -Force -ErrorAction Stop
-    Write-Ok "Enumeration basee sur l'acces desactivee : le dossier $DepotFolderName est visible."
+    Set-SmbShare -Name $share.Name -FolderEnumerationMode AccessBased -Force -ErrorAction Stop
+    Write-Ok "Enumeration basee sur l'acces activee."
 
+    # Droits "membre" reconnus (version actuelle et versions precedentes du script)
     $sync = [int]$FSR::Synchronize
-    $oldFiles = [int]$script:Rights.DepotFiles -band (-bnot $sync)
+    $memberRights = @($script:Rights.DepotMember, $script:Rights.DepotFolder, $script:Rights.DepotFiles) |
+                    ForEach-Object { [int]$_ -band (-bnot $sync) }
+
     $acl = Get-FolderAcl $layout.Depot
-    $removed = 0
+    $members = @{}
     foreach ($r in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
+        $sid = $r.IdentityReference
         $v = [int]$r.FileSystemRights -band (-bnot $sync)
-        if ($r.IdentityReference.Value -eq $script:SidOwnerRights.Value -or $v -eq $oldFiles) {
+        if ($sid.Value -eq $script:SidOwnerRights.Value) {
             [void]$acl.RemoveAccessRuleSpecific($r)
-            if ($r.IdentityReference.Value -ne $script:SidOwnerRights.Value) { $removed++ }
+        } elseif ($r.AccessControlType -eq 'Allow' -and $memberRights -contains $v) {
+            [void]$acl.RemoveAccessRuleSpecific($r)
+            $members[$sid.Value] = $sid
         }
     }
-    $acl.AddAccessRule((Get-OwnerRightsRule))
+    foreach ($sid in $members.Values) {
+        foreach ($rule in (Get-DepotRules $sid)) { $acl.AddAccessRule($rule) }
+    }
+    foreach ($rule in (Get-OwnerRightsRules)) { $acl.AddAccessRule($rule) }
     Set-FolderAcl $layout.Depot $acl
-    Write-Ok "$removed droit(s) d'ecriture sur les fichiers des autres retire(s), droits de l'auteur mis a jour."
+
+    foreach ($sid in $members.Values) { Write-Ok "Droits de depot mis a jour : $(ConvertTo-AccountName $sid)" }
+    Write-Ok 'Droits de l''auteur des depots mis a jour.'
 }
 
 # =====================================================================
