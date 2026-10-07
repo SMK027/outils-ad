@@ -400,7 +400,7 @@ function Select-AdPrincipals {
             Write-Info ('Selection actuelle : ' + (($selected | ForEach-Object { $_.Name }) -join ', '))
         }
     }
-    return @($selected)
+    return $selected.ToArray()
 }
 
 # =====================================================================
@@ -1099,7 +1099,7 @@ function Get-ShareDomainPrincipals($Share) {
         $p = Get-AdPrincipalBySid $e.Sid
         if ($p) { $result.Add($p) }
     }
-    return @($result)
+    return $result.ToArray()
 }
 
 function Select-FilterPrincipals($Share) {
