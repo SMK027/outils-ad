@@ -87,7 +87,10 @@ $script:Rights = @{
 # lister la destination pour copier. Grace a l'enumeration basee sur l'acces (ABE), la
 # liste n'affiche que les elements lisibles : aucun fichier depose n'est lisible par
 # les membres, le dossier leur apparait donc vide.
-$script:Rights.DepotMember = $script:Rights.DepotFolder -bor $FSR::ListDirectory
+# ReadPermissions complete le droit de lecture standard du dossier : l'ABE n'affiche un
+# dossier que si l'utilisateur possede la lecture complete (liste, attributs, autorisations).
+$script:Rights.DepotMemberV2 = $script:Rights.DepotFolder -bor $FSR::ListDirectory
+$script:Rights.DepotMember = $script:Rights.DepotMemberV2 -bor $FSR::ReadPermissions
 # OWNER RIGHTS : seul l'auteur d'un depot peut remplacer/supprimer SON fichier, sans le relire
 $script:Rights.OwnerFiles = $script:Rights.DepotFiles -bor $FSR::ReadAttributes -bor `
                             $FSR::ReadExtendedAttributes -bor $FSR::Delete
@@ -488,6 +491,7 @@ function Format-Rights($Rights) {
         'Depot (auteur : son fichier, sans lecture)' = $script:Rights.OwnerFiles
         'Depot (auteur : ses sous-dossiers)'       = $script:Rights.OwnerFolders
         'Depot ancienne version (option 7)'        = $script:Rights.DepotFolder
+        'Depot ancienne version 2 (option 7)'      = $script:Rights.DepotMemberV2
         'Depot ancienne version (ecriture)'        = $script:Rights.DepotFiles
     }
     foreach ($k in $known.Keys) {
@@ -1002,7 +1006,7 @@ function Repair-DepotRights {
 
     # Droits "membre" reconnus (version actuelle et versions precedentes du script)
     $sync = [int]$FSR::Synchronize
-    $memberRights = @($script:Rights.DepotMember, $script:Rights.DepotFolder, $script:Rights.DepotFiles) |
+    $memberRights = @($script:Rights.DepotMember, $script:Rights.DepotMemberV2, $script:Rights.DepotFolder, $script:Rights.DepotFiles) |
                     ForEach-Object { [int]$_ -band (-bnot $sync) }
 
     $acl = Get-FolderAcl $layout.Depot
