@@ -489,13 +489,21 @@ function Format-AppliesTo($Rule) {
 #  Partages
 # =====================================================================
 
+# Selon la version du module SmbShare, ShareType est renvoye sous forme de nom
+# (FileSystemDirectory, PrintQueue...) ou de valeur numerique brute (0, 1...) :
+# on exclut donc explicitement les types non fichiers au lieu d'exiger un nom precis.
+function Test-FileSystemShare($Share) {
+    $type = [string]$Share.ShareType
+    return ($type -notmatch '^(PrintQueue|CommunicationDevice|Ipc|1|2|3)$')
+}
+
 function Get-ManagedShares {
     return @(Get-SmbShare -ErrorAction Stop | Where-Object {
         -not $_.Special -and
         $_.Path -and
         $_.Name -notmatch '\$$' -and
         $script:ExcludedShares -notcontains $_.Name -and
-        [string]$_.ShareType -eq 'FileSystemDirectory'
+        (Test-FileSystemShare $_)
     } | Sort-Object Name)
 }
 
@@ -519,7 +527,7 @@ function Get-LayoutPaths($Layout) {
 
 function Select-Share {
     param([object[]]$Shares, [string]$Title = 'Choix du partage')
-    if (-not $Shares) { $Shares = Get-ManagedShares }
+    if (-not $Shares) { $Shares = @(Get-ManagedShares) }
     if ($Shares.Count -eq 0) {
         Write-Warn 'Aucun partage disponible.'
         return $null
@@ -667,7 +675,7 @@ function Show-ShareDetail($Share) {
 
 function Show-Shares {
     Write-Title 'Partages existants'
-    $shares = Get-ManagedShares
+    $shares = @(Get-ManagedShares)
     if ($shares.Count -eq 0) {
         Write-Warn 'Aucun partage (hors partages systeme) sur ce serveur.'
         return
@@ -1139,9 +1147,9 @@ function New-DriveMapGpo {
     $maps = @(Get-ExistingDriveMaps)
 
     if (-not $Share) {
-        $all = Get-ManagedShares
-        $free = @($all | Where-Object { (Get-ShareMappings $_.Name $maps).Count -eq 0 })
-        $mapped = @($all | Where-Object { (Get-ShareMappings $_.Name $maps).Count -gt 0 })
+        $all = @(Get-ManagedShares)
+        $free = @($all | Where-Object { @(Get-ShareMappings $_.Name $maps).Count -eq 0 })
+        $mapped = @($all | Where-Object { @(Get-ShareMappings $_.Name $maps).Count -gt 0 })
         if ($mapped.Count -gt 0) {
             Write-Host "`nPartages deja mappes (non proposes) :" -ForegroundColor Cyan
             foreach ($s in $mapped) {
